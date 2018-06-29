@@ -99,7 +99,7 @@ BACKWARDS INCOMPATIBILITIES / NOTES:
 NEW FEATURES:
 
 * **[Habitat](https://www.habitat.sh/) Provisioner** allowing automatic installation of the Habitat agent ([#16280](https://github.com/hashicorp/terraform/issues/16280))
- 
+
 IMPROVEMENTS:
 
 * core: removed duplicate prompts and clarified working when migration backend configurations ([#16939](https://github.com/hashicorp/terraform/issues/16939))
