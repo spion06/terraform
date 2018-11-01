@@ -102,20 +102,20 @@ func TestNewLocalSingle() backend.Backend {
 	return &TestLocalSingleState{Local: New()}
 }
 
-func (b *TestLocalSingleState) StateMgr(name string) (statemgr.Full, error) {
-	if name != backend.DefaultStateName {
-		return nil, backend.ErrWorkspacesNotSupported
-	}
-
-	return b.Local.StateMgr(name)
-}
-
 func (b *TestLocalSingleState) Workspaces() ([]string, error) {
 	return nil, backend.ErrWorkspacesNotSupported
 }
 
 func (b *TestLocalSingleState) DeleteWorkspace(string) error {
 	return backend.ErrWorkspacesNotSupported
+}
+
+func (b *TestLocalSingleState) StateMgr(name string) (statemgr.Full, error) {
+	if name != backend.DefaultStateName {
+		return nil, backend.ErrWorkspacesNotSupported
+	}
+
+	return b.Local.StateMgr(name)
 }
 
 // TestLocalNoDefaultState is a backend implementation that wraps
@@ -130,13 +130,6 @@ type TestLocalNoDefaultState struct {
 // This function matches the signature required for backend/init.
 func TestNewLocalNoDefault() backend.Backend {
 	return &TestLocalNoDefaultState{Local: New()}
-}
-
-func (b *TestLocalNoDefaultState) StateMgr(name string) (statemgr.Full, error) {
-	if name == backend.DefaultStateName {
-		return nil, backend.ErrDefaultWorkspaceNotSupported
-	}
-	return b.Local.StateMgr(name)
 }
 
 func (b *TestLocalNoDefaultState) Workspaces() ([]string, error) {
@@ -160,6 +153,13 @@ func (b *TestLocalNoDefaultState) DeleteWorkspace(name string) error {
 		return backend.ErrDefaultWorkspaceNotSupported
 	}
 	return b.Local.DeleteWorkspace(name)
+}
+
+func (b *TestLocalNoDefaultState) StateMgr(name string) (statemgr.Full, error) {
+	if name == backend.DefaultStateName {
+		return nil, backend.ErrDefaultWorkspaceNotSupported
+	}
+	return b.Local.StateMgr(name)
 }
 
 func testTempDir(t *testing.T) string {

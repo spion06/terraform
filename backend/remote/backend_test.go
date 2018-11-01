@@ -1,14 +1,12 @@
 package remote
 
 import (
-	"errors"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform/backend"
-	"github.com/hashicorp/terraform/config"
-	"github.com/hashicorp/terraform/terraform"
+	"github.com/zclconf/go-cty/cty"
 )
 
 func TestRemote(t *testing.T) {
@@ -30,63 +28,67 @@ func TestRemote_backendNoDefault(t *testing.T) {
 
 func TestRemote_config(t *testing.T) {
 	cases := map[string]struct {
-		config map[string]interface{}
-		err    error
+		config  cty.Value
+		confErr string
+		valErr  string
 	}{
 		"with_a_name": {
-			config: map[string]interface{}{
-				"organization": "hashicorp",
-				"workspaces": []interface{}{
-					map[string]interface{}{
-						"name": "prod",
-					},
-				},
-			},
-			err: nil,
+			config: cty.ObjectVal(map[string]cty.Value{
+				"hostname":     cty.NullVal(cty.String),
+				"organization": cty.StringVal("hashicorp"),
+				"token":        cty.NullVal(cty.String),
+				"workspaces": cty.ObjectVal(map[string]cty.Value{
+					"name":   cty.StringVal("prod"),
+					"prefix": cty.NullVal(cty.String),
+				}),
+			}),
 		},
 		"with_a_prefix": {
-			config: map[string]interface{}{
-				"organization": "hashicorp",
-				"workspaces": []interface{}{
-					map[string]interface{}{
-						"prefix": "my-app-",
-					},
-				},
-			},
-			err: nil,
+			config: cty.ObjectVal(map[string]cty.Value{
+				"hostname":     cty.NullVal(cty.String),
+				"organization": cty.StringVal("hashicorp"),
+				"token":        cty.NullVal(cty.String),
+				"workspaces": cty.ObjectVal(map[string]cty.Value{
+					"name":   cty.NullVal(cty.String),
+					"prefix": cty.StringVal("my-app-"),
+				}),
+			}),
 		},
 		"without_either_a_name_and_a_prefix": {
-			config: map[string]interface{}{
-				"organization": "hashicorp",
-				"workspaces": []interface{}{
-					map[string]interface{}{},
-				},
-			},
-			err: errors.New("either workspace 'name' or 'prefix' is required"),
+			config: cty.ObjectVal(map[string]cty.Value{
+				"hostname":     cty.NullVal(cty.String),
+				"organization": cty.StringVal("hashicorp"),
+				"token":        cty.NullVal(cty.String),
+				"workspaces": cty.ObjectVal(map[string]cty.Value{
+					"name":   cty.NullVal(cty.String),
+					"prefix": cty.NullVal(cty.String),
+				}),
+			}),
+			valErr: `Either workspace "name" or "prefix" is required`,
 		},
 		"with_both_a_name_and_a_prefix": {
-			config: map[string]interface{}{
-				"organization": "hashicorp",
-				"workspaces": []interface{}{
-					map[string]interface{}{
-						"name":   "prod",
-						"prefix": "my-app-",
-					},
-				},
-			},
-			err: errors.New("only one of workspace 'name' or 'prefix' is allowed"),
+			config: cty.ObjectVal(map[string]cty.Value{
+				"hostname":     cty.NullVal(cty.String),
+				"organization": cty.StringVal("hashicorp"),
+				"token":        cty.NullVal(cty.String),
+				"workspaces": cty.ObjectVal(map[string]cty.Value{
+					"name":   cty.StringVal("prod"),
+					"prefix": cty.StringVal("my-app-"),
+				}),
+			}),
+			valErr: `Only one of workspace "name" or "prefix" is allowed`,
 		},
 		"with_an_unknown_host": {
-			config: map[string]interface{}{
-				"hostname":     "nonexisting.local",
-				"organization": "hashicorp",
-				"workspaces": []interface{}{
-					map[string]interface{}{
-						"name": "prod",
-					},
-				},
-			},
-			err: errors.New("host nonexisting.local does not provide a remote backend API"),
+			config: cty.ObjectVal(map[string]cty.Value{
+				"hostname":     cty.StringVal("nonexisting.local"),
+				"organization": cty.StringVal("hashicorp"),
+				"token":        cty.NullVal(cty.String),
+				"workspaces": cty.ObjectVal(map[string]cty.Value{
+					"name":   cty.StringVal("prod"),
+					"prefix": cty.NullVal(cty.String),
+				}),
+			}),
+			confErr: "Host nonexisting.local does not provide a remote backend API",
 		},
 	}
 
@@ -94,26 +96,18 @@ func TestRemote_config(t *testing.T) {
 		s := testServer(t)
 		b := New(testDisco(s))
 
-		// Get the proper config structure
-		rc, err := config.NewRawConfig(tc.config)
-		if err != nil {
-			t.Fatalf("%s: error creating raw config: %v", name, err)
-		}
-		conf := terraform.NewResourceConfig(rc)
-
 		// Validate
-		warns, errs := b.Validate(conf)
-		if len(warns) > 0 {
-			t.Fatalf("%s: validation warnings: %v", name, warns)
-		}
-		if len(errs) > 0 {
-			t.Fatalf("%s: validation errors: %v", name, errs)
+		valDiags := b.ValidateConfig(tc.config)
+		if (valDiags.Err() == nil && tc.valErr != "") ||
+			(valDiags.Err() != nil && !strings.Contains(valDiags.Err().Error(), tc.valErr)) {
+			t.Fatalf("%s: unexpected validation result: %v", name, valDiags.Err())
 		}
 
 		// Configure
-		err = b.Configure(conf)
-		if err != tc.err && err != nil && tc.err != nil && err.Error() != tc.err.Error() {
-			t.Fatalf("%s: expected error %q, got: %q", name, tc.err, err)
+		confDiags := b.Configure(tc.config)
+		if (confDiags.Err() == nil && tc.confErr != "") ||
+			(confDiags.Err() != nil && !strings.Contains(confDiags.Err().Error(), tc.confErr)) {
+			t.Fatalf("%s: unexpected configure result: %v", name, valDiags.Err())
 		}
 	}
 }
@@ -124,117 +118,117 @@ func TestRemote_nonexistingOrganization(t *testing.T) {
 	b := testBackendNoDefault(t)
 	b.organization = "nonexisting"
 
-	if _, err := b.State("prod"); err == nil || !strings.Contains(err.Error(), msg) {
+	if _, err := b.StateMgr("prod"); err == nil || !strings.Contains(err.Error(), msg) {
 		t.Fatalf("expected %q error, got: %v", msg, err)
 	}
 
-	if err := b.DeleteState("prod"); err == nil || !strings.Contains(err.Error(), msg) {
+	if err := b.DeleteWorkspace("prod"); err == nil || !strings.Contains(err.Error(), msg) {
 		t.Fatalf("expected %q error, got: %v", msg, err)
 	}
 
-	if _, err := b.States(); err == nil || !strings.Contains(err.Error(), msg) {
+	if _, err := b.Workspaces(); err == nil || !strings.Contains(err.Error(), msg) {
 		t.Fatalf("expected %q error, got: %v", msg, err)
 	}
 }
 
-func TestRemote_addAndRemoveStatesDefault(t *testing.T) {
+func TestRemote_addAndRemoveWorkspacesDefault(t *testing.T) {
 	b := testBackendDefault(t)
-	if _, err := b.States(); err != backend.ErrWorkspacesNotSupported {
+	if _, err := b.Workspaces(); err != backend.ErrWorkspacesNotSupported {
 		t.Fatalf("expected error %v, got %v", backend.ErrWorkspacesNotSupported, err)
 	}
 
-	if _, err := b.State(backend.DefaultStateName); err != nil {
+	if _, err := b.StateMgr(backend.DefaultStateName); err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if _, err := b.State("prod"); err != backend.ErrWorkspacesNotSupported {
+	if _, err := b.StateMgr("prod"); err != backend.ErrWorkspacesNotSupported {
 		t.Fatalf("expected error %v, got %v", backend.ErrWorkspacesNotSupported, err)
 	}
 
-	if err := b.DeleteState(backend.DefaultStateName); err != nil {
+	if err := b.DeleteWorkspace(backend.DefaultStateName); err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if err := b.DeleteState("prod"); err != backend.ErrWorkspacesNotSupported {
+	if err := b.DeleteWorkspace("prod"); err != backend.ErrWorkspacesNotSupported {
 		t.Fatalf("expected error %v, got %v", backend.ErrWorkspacesNotSupported, err)
 	}
 }
 
-func TestRemote_addAndRemoveStatesNoDefault(t *testing.T) {
+func TestRemote_addAndRemoveWorkspacesNoDefault(t *testing.T) {
 	b := testBackendNoDefault(t)
-	states, err := b.States()
+	states, err := b.Workspaces()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	expectedStates := []string(nil)
-	if !reflect.DeepEqual(states, expectedStates) {
-		t.Fatalf("expected states %#+v, got %#+v", expectedStates, states)
+	expectedWorkspaces := []string(nil)
+	if !reflect.DeepEqual(states, expectedWorkspaces) {
+		t.Fatalf("expected states %#+v, got %#+v", expectedWorkspaces, states)
 	}
 
-	if _, err := b.State(backend.DefaultStateName); err != backend.ErrDefaultWorkspaceNotSupported {
+	if _, err := b.StateMgr(backend.DefaultStateName); err != backend.ErrDefaultWorkspaceNotSupported {
 		t.Fatalf("expected error %v, got %v", backend.ErrDefaultWorkspaceNotSupported, err)
 	}
 
 	expectedA := "test_A"
-	if _, err := b.State(expectedA); err != nil {
+	if _, err := b.StateMgr(expectedA); err != nil {
 		t.Fatal(err)
 	}
 
-	states, err = b.States()
+	states, err = b.Workspaces()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	expectedStates = append(expectedStates, expectedA)
-	if !reflect.DeepEqual(states, expectedStates) {
-		t.Fatalf("expected %#+v, got %#+v", expectedStates, states)
+	expectedWorkspaces = append(expectedWorkspaces, expectedA)
+	if !reflect.DeepEqual(states, expectedWorkspaces) {
+		t.Fatalf("expected %#+v, got %#+v", expectedWorkspaces, states)
 	}
 
 	expectedB := "test_B"
-	if _, err := b.State(expectedB); err != nil {
+	if _, err := b.StateMgr(expectedB); err != nil {
 		t.Fatal(err)
 	}
 
-	states, err = b.States()
+	states, err = b.Workspaces()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	expectedStates = append(expectedStates, expectedB)
-	if !reflect.DeepEqual(states, expectedStates) {
-		t.Fatalf("expected %#+v, got %#+v", expectedStates, states)
+	expectedWorkspaces = append(expectedWorkspaces, expectedB)
+	if !reflect.DeepEqual(states, expectedWorkspaces) {
+		t.Fatalf("expected %#+v, got %#+v", expectedWorkspaces, states)
 	}
 
-	if err := b.DeleteState(backend.DefaultStateName); err != backend.ErrDefaultWorkspaceNotSupported {
+	if err := b.DeleteWorkspace(backend.DefaultStateName); err != backend.ErrDefaultWorkspaceNotSupported {
 		t.Fatalf("expected error %v, got %v", backend.ErrDefaultWorkspaceNotSupported, err)
 	}
 
-	if err := b.DeleteState(expectedA); err != nil {
+	if err := b.DeleteWorkspace(expectedA); err != nil {
 		t.Fatal(err)
 	}
 
-	states, err = b.States()
+	states, err = b.Workspaces()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	expectedStates = []string{expectedB}
-	if !reflect.DeepEqual(states, expectedStates) {
-		t.Fatalf("expected %#+v got %#+v", expectedStates, states)
+	expectedWorkspaces = []string{expectedB}
+	if !reflect.DeepEqual(states, expectedWorkspaces) {
+		t.Fatalf("expected %#+v got %#+v", expectedWorkspaces, states)
 	}
 
-	if err := b.DeleteState(expectedB); err != nil {
+	if err := b.DeleteWorkspace(expectedB); err != nil {
 		t.Fatal(err)
 	}
 
-	states, err = b.States()
+	states, err = b.Workspaces()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	expectedStates = []string(nil)
-	if !reflect.DeepEqual(states, expectedStates) {
-		t.Fatalf("expected %#+v, got %#+v", expectedStates, states)
+	expectedWorkspaces = []string(nil)
+	if !reflect.DeepEqual(states, expectedWorkspaces) {
+		t.Fatalf("expected %#+v, got %#+v", expectedWorkspaces, states)
 	}
 }

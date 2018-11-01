@@ -1204,14 +1204,14 @@ func TestMetaBackend_configuredChangeCopy_multiToNoDefaultWithDefault(t *testing
 	}
 
 	sort.Strings(workspaces)
-	expected := []string{"default", "env2"}
+	expected := []string{"env1", "env2"}
 	if !reflect.DeepEqual(workspaces, expected) {
 		t.Fatalf("bad: %#v", workspaces)
 	}
 
 	{
 		// Check the renamed default state
-		s, err := b.StateMgr("env2")
+		s, err := b.StateMgr("env1")
 		if err != nil {
 			t.Fatalf("unexpected error: %s", err)
 		}
@@ -1222,7 +1222,7 @@ func TestMetaBackend_configuredChangeCopy_multiToNoDefaultWithDefault(t *testing
 		if state == nil {
 			t.Fatal("state should not be nil")
 		}
-		if testStateMgrCurrentLineage(s) != "backend-change-env2" {
+		if testStateMgrCurrentLineage(s) != "backend-change-env1" {
 			t.Fatalf("bad: %#v", state)
 		}
 	}

@@ -9,13 +9,14 @@ import (
 	"testing"
 
 	tfe "github.com/hashicorp/go-tfe"
-	"github.com/hashicorp/hcl2/hcl"
 	"github.com/hashicorp/terraform/backend"
 	"github.com/hashicorp/terraform/state/remote"
 	"github.com/hashicorp/terraform/svchost"
 	"github.com/hashicorp/terraform/svchost/auth"
 	"github.com/hashicorp/terraform/svchost/disco"
+	"github.com/hashicorp/terraform/tfdiags"
 	"github.com/mitchellh/cli"
+	"github.com/zclconf/go-cty/cty"
 )
 
 const (
@@ -34,27 +35,29 @@ func testInput(t *testing.T, answers map[string]string) *mockInput {
 }
 
 func testBackendDefault(t *testing.T) *Remote {
-	c := map[string]interface{}{
-		"organization": "hashicorp",
-		"workspaces": []interface{}{
-			map[string]interface{}{
-				"name": "prod",
-			},
-		},
-	}
-	return testBackend(t, backend.TestWrapConfig(c))
+	obj := cty.ObjectVal(map[string]cty.Value{
+		"hostname":     cty.NullVal(cty.String),
+		"organization": cty.StringVal("hashicorp"),
+		"token":        cty.NullVal(cty.String),
+		"workspaces": cty.ObjectVal(map[string]cty.Value{
+			"name":   cty.StringVal("prod"),
+			"prefix": cty.NullVal(cty.String),
+		}),
+	})
+	return testBackend(t, obj)
 }
 
 func testBackendNoDefault(t *testing.T) *Remote {
-	c := map[string]interface{}{
-		"organization": "hashicorp",
-		"workspaces": []interface{}{
-			map[string]interface{}{
-				"prefix": "my-app-",
-			},
-		},
-	}
-	return testBackend(t, backend.TestWrapConfig(c))
+	obj := cty.ObjectVal(map[string]cty.Value{
+		"hostname":     cty.NullVal(cty.String),
+		"organization": cty.StringVal("hashicorp"),
+		"token":        cty.NullVal(cty.String),
+		"workspaces": cty.ObjectVal(map[string]cty.Value{
+			"name":   cty.NullVal(cty.String),
+			"prefix": cty.StringVal("my-app-"),
+		}),
+	})
+	return testBackend(t, obj)
 }
 
 func testRemoteClient(t *testing.T) remote.Client {
@@ -67,12 +70,20 @@ func testRemoteClient(t *testing.T) remote.Client {
 	return s.Client
 }
 
-func testBackend(t *testing.T, c hcl.Body) *Remote {
+func testBackend(t *testing.T, obj cty.Value) *Remote {
 	s := testServer(t)
 	b := New(testDisco(s))
 
 	// Configure the backend so the client is created.
-	backend.TestBackendConfig(t, b, c)
+	valDiags := b.ValidateConfig(obj)
+	if len(valDiags) != 0 {
+		t.Fatal(valDiags.ErrWithWarnings())
+	}
+
+	confDiags := b.Configure(obj)
+	if len(confDiags) != 0 {
+		t.Fatal(confDiags.ErrWithWarnings())
+	}
 
 	// Get a new mock client.
 	mc := newMockClient()
@@ -87,6 +98,13 @@ func testBackend(t *testing.T, c hcl.Body) *Remote {
 	b.client.Runs = mc.Runs
 	b.client.StateVersions = mc.StateVersions
 	b.client.Workspaces = mc.Workspaces
+
+	b.ShowDiagnostics = func(vals ...interface{}) {
+		var diags tfdiags.Diagnostics
+		for _, diag := range diags.Append(vals...) {
+			b.CLI.Error(diag.Description().Summary)
+		}
+	}
 
 	ctx := context.Background()
 

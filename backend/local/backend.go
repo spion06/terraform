@@ -426,7 +426,10 @@ func (b *Local) ReportResult(op *backend.RunningOperation, diags tfdiags.Diagnos
 		// Shouldn't generally happen, but if it does then we'll at least
 		// make some noise in the logs to help us spot it.
 		if len(diags) != 0 {
-			log.Printf("[ERROR] Local backend needs to report diagnostics but ShowDiagnostics callback is not set: %s", diags.ErrWithWarnings())
+			log.Printf(
+				"[ERROR] Local backend needs to report diagnostics but ShowDiagnostics is not set:\n%s",
+				diags.ErrWithWarnings(),
+			)
 		}
 	}
 }

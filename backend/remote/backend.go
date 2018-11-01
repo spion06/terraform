@@ -13,20 +13,22 @@ import (
 
 	tfe "github.com/hashicorp/go-tfe"
 	"github.com/hashicorp/terraform/backend"
+	"github.com/hashicorp/terraform/configs/configschema"
 	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/hashicorp/terraform/state"
 	"github.com/hashicorp/terraform/state/remote"
 	"github.com/hashicorp/terraform/svchost"
 	"github.com/hashicorp/terraform/svchost/disco"
 	"github.com/hashicorp/terraform/terraform"
+	"github.com/hashicorp/terraform/tfdiags"
 	"github.com/hashicorp/terraform/version"
 	"github.com/mitchellh/cli"
 	"github.com/mitchellh/colorstring"
+	"github.com/zclconf/go-cty/cty"
 )
 
 const (
 	defaultHostname    = "app.terraform.io"
-	defaultModuleDepth = -1
 	defaultParallelism = 10
 	serviceID          = "tfe.v2"
 )
@@ -38,6 +40,9 @@ type Remote struct {
 	// output will be done. If CLIColor is nil then no coloring will be done.
 	CLI      cli.Ui
 	CLIColor *colorstring.Colorize
+
+	// ShowDiagnostics prints diagnostic messages to the UI.
+	ShowDiagnostics func(vals ...interface{})
 
 	// ContextOpts are the base context options to set when initializing a
 	// new Terraform context. Many of these will be overridden or merged by
@@ -70,102 +75,163 @@ type Remote struct {
 	opLock sync.Mutex
 }
 
+var _ backend.Backend = (*Remote)(nil)
+
 // New creates a new initialized remote backend.
 func New(services *disco.Disco) *Remote {
-	b := &Remote{
+	return &Remote{
 		services: services,
 	}
+}
 
-	b.schema = &schema.Backend{
-		Schema: map[string]*schema.Schema{
-			"hostname": &schema.Schema{
-				Type:        schema.TypeString,
+func (b *Remote) ConfigSchema() *configschema.Block {
+	return &configschema.Block{
+		Attributes: map[string]*configschema.Attribute{
+			"hostname": {
+				Type:        cty.String,
 				Optional:    true,
 				Description: schemaDescriptions["hostname"],
-				Default:     defaultHostname,
 			},
-
-			"organization": &schema.Schema{
-				Type:        schema.TypeString,
+			"organization": {
+				Type:        cty.String,
 				Required:    true,
 				Description: schemaDescriptions["organization"],
 			},
-
-			"token": &schema.Schema{
-				Type:        schema.TypeString,
+			"token": {
+				Type:        cty.String,
 				Optional:    true,
 				Description: schemaDescriptions["token"],
 			},
+		},
 
-			"workspaces": &schema.Schema{
-				Type:        schema.TypeSet,
-				Required:    true,
-				Description: schemaDescriptions["workspaces"],
-				MinItems:    1,
-				MaxItems:    1,
-				Elem: &schema.Resource{
-					Schema: map[string]*schema.Schema{
-						"name": &schema.Schema{
-							Type:        schema.TypeString,
+		BlockTypes: map[string]*configschema.NestedBlock{
+			"workspaces": {
+				Block: configschema.Block{
+					Attributes: map[string]*configschema.Attribute{
+						"name": {
+							Type:        cty.String,
 							Optional:    true,
 							Description: schemaDescriptions["name"],
 						},
-
-						"prefix": &schema.Schema{
-							Type:        schema.TypeString,
+						"prefix": {
+							Type:        cty.String,
 							Optional:    true,
 							Description: schemaDescriptions["prefix"],
 						},
 					},
 				},
+				Nesting: configschema.NestingSingle,
 			},
 		},
-
-		ConfigureFunc: b.configure,
 	}
-
-	return b
 }
 
-func (b *Remote) configure(ctx context.Context) error {
-	d := schema.FromContextBackendConfig(ctx)
+func (b *Remote) ValidateConfig(obj cty.Value) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
 
-	// Get the hostname and organization.
-	b.hostname = d.Get("hostname").(string)
-	b.organization = d.Get("organization").(string)
+	if val := obj.GetAttr("organization"); !val.IsNull() {
+		if val.AsString() == "" {
+			diags = diags.Append(tfdiags.AttributeValue(
+				tfdiags.Error,
+				"Invalid organization value",
+				`The "organization" attribute value must not be empty.`,
+				cty.Path{cty.GetAttrStep{Name: "organization"}},
+			))
+		}
+	}
 
-	// Get and assert the workspaces configuration block.
-	workspace := d.Get("workspaces").(*schema.Set).List()[0].(map[string]interface{})
-
-	// Get the default workspace name and prefix.
-	b.workspace = workspace["name"].(string)
-	b.prefix = workspace["prefix"].(string)
+	var name, prefix string
+	if workspaces := obj.GetAttr("workspaces"); !workspaces.IsNull() {
+		if val := workspaces.GetAttr("name"); !val.IsNull() {
+			name = val.AsString()
+		}
+		if val := workspaces.GetAttr("prefix"); !val.IsNull() {
+			prefix = val.AsString()
+		}
+	}
 
 	// Make sure that we have either a workspace name or a prefix.
-	if b.workspace == "" && b.prefix == "" {
-		return fmt.Errorf("either workspace 'name' or 'prefix' is required")
+	if name == "" && prefix == "" {
+		diags = diags.Append(tfdiags.AttributeValue(
+			tfdiags.Error,
+			"Invalid workspaces configuration",
+			`Either workspace "name" or "prefix" is required.`,
+			cty.Path{cty.GetAttrStep{Name: "workspaces"}},
+		))
 	}
 
 	// Make sure that only one of workspace name or a prefix is configured.
-	if b.workspace != "" && b.prefix != "" {
-		return fmt.Errorf("only one of workspace 'name' or 'prefix' is allowed")
+	if name != "" && prefix != "" {
+		diags = diags.Append(tfdiags.AttributeValue(
+			tfdiags.Error,
+			"Invalid workspaces configuration",
+			`Only one of workspace "name" or "prefix" is allowed.`,
+			cty.Path{cty.GetAttrStep{Name: "workspaces"}},
+		))
+	}
+
+	return diags
+}
+
+func (b *Remote) Configure(obj cty.Value) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+
+	// Get the hostname.
+	if val := obj.GetAttr("hostname"); !val.IsNull() && val.AsString() != "" {
+		b.hostname = val.AsString()
+	} else {
+		b.hostname = defaultHostname
+	}
+
+	// Get the organization.
+	if val := obj.GetAttr("organization"); !val.IsNull() {
+		b.organization = val.AsString()
+	}
+
+	// Get the workspaces configuration block and retrieve the
+	// default workspace name and prefix.
+	if workspaces := obj.GetAttr("workspaces"); !workspaces.IsNull() {
+		if val := workspaces.GetAttr("name"); !val.IsNull() {
+			b.workspace = val.AsString()
+		}
+		if val := workspaces.GetAttr("prefix"); !val.IsNull() {
+			b.prefix = val.AsString()
+		}
 	}
 
 	// Discover the service URL for this host to confirm that it provides
 	// a remote backend API and to discover the required base path.
 	service, err := b.discover(b.hostname)
 	if err != nil {
-		return err
+		diags = diags.Append(tfdiags.AttributeValue(
+			tfdiags.Error,
+			strings.ToUpper(err.Error()[:1])+err.Error()[1:],
+			`If you are sure the hostname is correct, this could also indicate SSL `+
+				`verification issues. Please use "openssl s_client -connect <HOST>" to `+
+				`identify any certificate or certificate chain issues.`,
+			cty.Path{cty.GetAttrStep{Name: "hostname"}},
+		))
+		return diags
 	}
 
 	// Retrieve the token for this host as configured in the credentials
 	// section of the CLI Config File.
 	token, err := b.token(b.hostname)
 	if err != nil {
-		return err
+		diags = diags.Append(tfdiags.AttributeValue(
+			tfdiags.Error,
+			strings.ToUpper(err.Error()[:1])+err.Error()[1:],
+			`If you are sure the hostname is correct, this could also indicate SSL `+
+				`verification issues. Please use "openssl s_client -connect <HOST>" to `+
+				`identify any certificate or certificate chain issues.`,
+			cty.Path{cty.GetAttrStep{Name: "hostname"}},
+		))
+		return diags
 	}
 	if token == "" {
-		token = d.Get("token").(string)
+		if val := obj.GetAttr("token"); !val.IsNull() {
+			token = val.AsString()
+		}
 	}
 
 	cfg := &tfe.Config{
@@ -181,10 +247,17 @@ func (b *Remote) configure(ctx context.Context) error {
 	// Create the remote backend API client.
 	b.client, err = tfe.NewClient(cfg)
 	if err != nil {
-		return err
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to create the Terraform Enterprise client",
+			fmt.Sprintf(
+				`The "remote" backend encountered an unexpected error while creating the `+
+					`Terraform Enterprise client: %s.`, err,
+			),
+		))
 	}
 
-	return nil
+	return diags
 }
 
 // discover the remote backend API service URL and token.
@@ -219,126 +292,15 @@ func (b *Remote) token(hostname string) (string, error) {
 	return "", nil
 }
 
-// Input is called to ask the user for input for completing the configuration.
-func (b *Remote) Input(ui terraform.UIInput, c *terraform.ResourceConfig) (*terraform.ResourceConfig, error) {
-	return b.schema.Input(ui, c)
-}
-
-// Validate is called once at the beginning with the raw configuration and
-// can return a list of warnings and/or errors.
-func (b *Remote) Validate(c *terraform.ResourceConfig) ([]string, []error) {
-	return b.schema.Validate(c)
-}
-
-// Configure configures the backend itself with the configuration given.
-func (b *Remote) Configure(c *terraform.ResourceConfig) error {
-	return b.schema.Configure(c)
-}
-
-// State returns the latest state of the given remote workspace. The workspace
-// will be created if it doesn't exist.
-func (b *Remote) State(workspace string) (state.State, error) {
-	if b.workspace == "" && workspace == backend.DefaultStateName {
-		return nil, backend.ErrDefaultStateNotSupported
-	}
-	if b.prefix == "" && workspace != backend.DefaultStateName {
-		return nil, backend.ErrNamedStatesNotSupported
-	}
-
-	workspaces, err := b.states()
-	if err != nil {
-		return nil, fmt.Errorf("Error retrieving workspaces: %v", err)
-	}
-
-	exists := false
-	for _, name := range workspaces {
-		if workspace == name {
-			exists = true
-			break
-		}
-	}
-
-	// Configure the remote workspace name.
-	switch {
-	case workspace == backend.DefaultStateName:
-		workspace = b.workspace
-	case b.prefix != "" && !strings.HasPrefix(workspace, b.prefix):
-		workspace = b.prefix + workspace
-	}
-
-	if !exists {
-		options := tfe.WorkspaceCreateOptions{
-			Name: tfe.String(workspace),
-		}
-
-		// We only set the Terraform Version for the new workspace if this is
-		// a release candidate or a final release.
-		if version.Prerelease == "" || strings.HasPrefix(version.Prerelease, "rc") {
-			options.TerraformVersion = tfe.String(version.String())
-		}
-
-		_, err = b.client.Workspaces.Create(context.Background(), b.organization, options)
-		if err != nil {
-			return nil, fmt.Errorf("Error creating workspace %s: %v", workspace, err)
-		}
-	}
-
-	client := &remoteClient{
-		client:       b.client,
-		organization: b.organization,
-		workspace:    workspace,
-
-		// This is optionally set during Terraform Enterprise runs.
-		runID: os.Getenv("TFE_RUN_ID"),
-	}
-
-	return &remote.State{Client: client}, nil
-}
-
-// DeleteState removes the remote workspace if it exists.
-func (b *Remote) DeleteState(workspace string) error {
-	if b.workspace == "" && workspace == backend.DefaultStateName {
-		return backend.ErrDefaultStateNotSupported
-	}
-	if b.prefix == "" && workspace != backend.DefaultStateName {
-		return backend.ErrNamedStatesNotSupported
-	}
-
-	// Configure the remote workspace name.
-	switch {
-	case workspace == backend.DefaultStateName:
-		workspace = b.workspace
-	case b.prefix != "" && !strings.HasPrefix(workspace, b.prefix):
-		workspace = b.prefix + workspace
-	}
-
-	// Check if the configured organization exists.
-	_, err := b.client.Organizations.Read(context.Background(), b.organization)
-	if err != nil {
-		if err == tfe.ErrResourceNotFound {
-			return fmt.Errorf("organization %s does not exist", b.organization)
-		}
-		return err
-	}
-
-	client := &remoteClient{
-		client:       b.client,
-		organization: b.organization,
-		workspace:    workspace,
-	}
-
-	return client.Delete()
-}
-
-// States returns a filtered list of remote workspace names.
-func (b *Remote) States() ([]string, error) {
+// Workspaces returns a filtered list of remote workspace names.
+func (b *Remote) Workspaces() ([]string, error) {
 	if b.prefix == "" {
-		return nil, backend.ErrNamedStatesNotSupported
+		return nil, backend.ErrWorkspacesNotSupported
 	}
-	return b.states()
+	return b.workspaces()
 }
 
-func (b *Remote) states() ([]string, error) {
+func (b *Remote) workspaces() ([]string, error) {
 	// Check if the configured organization exists.
 	_, err := b.client.Organizations.Read(context.Background(), b.organization)
 	if err != nil {
@@ -388,6 +350,101 @@ func (b *Remote) states() ([]string, error) {
 	sort.StringSlice(names).Sort()
 
 	return names, nil
+}
+
+// DeleteWorkspace removes the remote workspace if it exists.
+func (b *Remote) DeleteWorkspace(name string) error {
+	if b.workspace == "" && name == backend.DefaultStateName {
+		return backend.ErrDefaultWorkspaceNotSupported
+	}
+	if b.prefix == "" && name != backend.DefaultStateName {
+		return backend.ErrWorkspacesNotSupported
+	}
+
+	// Configure the remote workspace name.
+	switch {
+	case name == backend.DefaultStateName:
+		name = b.workspace
+	case b.prefix != "" && !strings.HasPrefix(name, b.prefix):
+		name = b.prefix + name
+	}
+
+	// Check if the configured organization exists.
+	_, err := b.client.Organizations.Read(context.Background(), b.organization)
+	if err != nil {
+		if err == tfe.ErrResourceNotFound {
+			return fmt.Errorf("organization %s does not exist", b.organization)
+		}
+		return err
+	}
+
+	client := &remoteClient{
+		client:       b.client,
+		organization: b.organization,
+		workspace:    name,
+	}
+
+	return client.Delete()
+}
+
+// StateMgr returns the latest state of the given remote workspace. The
+// workspace will be created if it doesn't exist.
+func (b *Remote) StateMgr(name string) (state.State, error) {
+	if b.workspace == "" && name == backend.DefaultStateName {
+		return nil, backend.ErrDefaultWorkspaceNotSupported
+	}
+	if b.prefix == "" && name != backend.DefaultStateName {
+		return nil, backend.ErrWorkspacesNotSupported
+	}
+
+	workspaces, err := b.workspaces()
+	if err != nil {
+		return nil, fmt.Errorf("Error retrieving workspaces: %v", err)
+	}
+
+	exists := false
+	for _, workspace := range workspaces {
+		if name == workspace {
+			exists = true
+			break
+		}
+	}
+
+	// Configure the remote workspace name.
+	switch {
+	case name == backend.DefaultStateName:
+		name = b.workspace
+	case b.prefix != "" && !strings.HasPrefix(name, b.prefix):
+		name = b.prefix + name
+	}
+
+	if !exists {
+		options := tfe.WorkspaceCreateOptions{
+			Name: tfe.String(name),
+		}
+
+		// We only set the Terraform Version for the new workspace if this is
+		// a release candidate or a final release.
+		if version.Prerelease == "" || strings.HasPrefix(version.Prerelease, "rc") {
+			options.TerraformVersion = tfe.String(version.String())
+		}
+
+		_, err = b.client.Workspaces.Create(context.Background(), b.organization, options)
+		if err != nil {
+			return nil, fmt.Errorf("Error creating workspace %s: %v", name, err)
+		}
+	}
+
+	client := &remoteClient{
+		client:       b.client,
+		organization: b.organization,
+		workspace:    name,
+
+		// This is optionally set during Terraform Enterprise runs.
+		runID: os.Getenv("TFE_RUN_ID"),
+	}
+
+	return &remote.State{Client: client}, nil
 }
 
 // Operation implements backend.Enhanced
@@ -444,7 +501,7 @@ func (b *Remote) Operation(ctx context.Context, op *backend.Operation) (*backend
 
 		r, opErr := f(stopCtx, cancelCtx, op)
 		if opErr != nil && opErr != context.Canceled {
-			runningOp.Err = opErr
+			b.ReportResult(runningOp, opErr)
 			return
 		}
 
@@ -452,7 +509,7 @@ func (b *Remote) Operation(ctx context.Context, op *backend.Operation) (*backend
 			// Retrieve the run to get its current status.
 			r, err := b.client.Runs.Read(cancelCtx, r.ID)
 			if err != nil {
-				runningOp.Err = generalError("error retrieving run", err)
+				b.ReportResult(runningOp, generalError("Failed to retrieve run", err))
 				return
 			}
 
@@ -460,11 +517,14 @@ func (b *Remote) Operation(ctx context.Context, op *backend.Operation) (*backend
 			runningOp.PlanEmpty = !r.HasChanges
 
 			if opErr == context.Canceled {
-				runningOp.Err = b.cancel(cancelCtx, op, r)
+				if err := b.cancel(cancelCtx, op, r); err != nil {
+					b.ReportResult(runningOp, generalError("Failed to retrieve run", err))
+					return
+				}
 			}
 
-			if runningOp.Err == nil && r.Status == tfe.RunErrored {
-				runningOp.ExitCode = 1
+			if r.Status == tfe.RunErrored {
+				runningOp.Result = backend.OperationFailure
 			}
 		}
 	}()
@@ -484,7 +544,7 @@ func (b *Remote) cancel(cancelCtx context.Context, op *backend.Operation, r *tfe
 				Description: "Only 'yes' will be accepted to cancel.",
 			})
 			if err != nil {
-				return generalError("error asking to cancel", err)
+				return generalError("Failed asking to cancel", err)
 			}
 			if v != "yes" {
 				if b.CLI != nil {
@@ -502,7 +562,7 @@ func (b *Remote) cancel(cancelCtx context.Context, op *backend.Operation, r *tfe
 		// Try to cancel the remote operation.
 		err := b.client.Runs.Cancel(cancelCtx, r.ID, tfe.RunCancelOptions{})
 		if err != nil {
-			return generalError("error cancelling run", err)
+			return generalError("Failed to cancel run", err)
 		}
 		if b.CLI != nil {
 			b.CLI.Output(b.Colorize().Color(strings.TrimSpace(operationCanceled)))
@@ -510,6 +570,42 @@ func (b *Remote) cancel(cancelCtx context.Context, op *backend.Operation, r *tfe
 	}
 
 	return nil
+}
+
+// ReportResult is a helper for the common chore of setting the status of
+// a running operation and showing any diagnostics produced during that
+// operation.
+//
+// If the given diagnostics contains errors then the operation's result
+// will be set to backend.OperationFailure. It will be set to
+// backend.OperationSuccess otherwise. It will then use b.ShowDiagnostics
+// to show the given diagnostics before returning.
+//
+// Callers should feel free to do each of these operations separately in
+// more complex cases where e.g. diagnostics are interleaved with other
+// output, but terminating immediately after reporting error diagnostics is
+// common and can be expressed concisely via this method.
+func (b *Remote) ReportResult(op *backend.RunningOperation, err error) {
+	diags := tfdiags.Diagnostics{}.Append(err)
+
+	if diags.HasErrors() {
+		op.Result = backend.OperationFailure
+	} else {
+		op.Result = backend.OperationSuccess
+	}
+
+	if b.ShowDiagnostics != nil {
+		b.ShowDiagnostics(diags)
+	} else {
+		// Shouldn't generally happen, but if it does then we'll at least
+		// make some noise in the logs to help us spot it.
+		if len(diags) != 0 {
+			log.Printf(
+				"[ERROR] Remote backend needs to report diagnostics but ShowDiagnostics is not set:\n%s",
+				diags.ErrWithWarnings(),
+			)
+		}
+	}
 }
 
 // Colorize returns the Colorize structure that can be used for colorizing
@@ -534,28 +630,26 @@ func generalError(msg string, err error) error {
 	case context.Canceled:
 		return err
 	case tfe.ErrResourceNotFound:
-		return fmt.Errorf(strings.TrimSpace(fmt.Sprintf(notFoundErr, msg, err)))
+		diag := tfdiags.Sourceless(
+			tfdiags.Error,
+			fmt.Sprintf("%s: %v", msg, err),
+			`The configured "remote" backend returns '404 Not Found' errors for resources `+
+				`that do not exist, as well as for resources that a user doesn't have access `+
+				`to. When the resource does exists, please check the rights for the used token.`,
+		)
+		return tfdiags.Diagnostics{diag}.Err()
 	default:
-		return fmt.Errorf(strings.TrimSpace(fmt.Sprintf(generalErr, msg, err)))
+		diag := tfdiags.Sourceless(
+			tfdiags.Error,
+			fmt.Sprintf("%s: %v", msg, err),
+			`The configured "remote" backend encountered an unexpected error. Sometimes `+
+				`this is caused by network connection problems, in which case you could retry `+
+				`the command. If the issue persists please open a support ticket to get help `+
+				`resolving the problem.`,
+		)
+		return tfdiags.Diagnostics{diag}.Err()
 	}
 }
-
-const generalErr = `
-%s: %v
-
-The configured "remote" backend encountered an unexpected error. Sometimes
-this is caused by network connection problems, in which case you could retry
-the command. If the issue persists please open a support ticket to get help
-resolving the problem.
-`
-
-const notFoundErr = `
-%s: %v
-
-The configured "remote" backend returns '404 Not Found' errors for resources
-that do not exist, as well as for resources that a user doesn't have access
-to. When the resource does exists, please check the rights for the used token.
-`
 
 const operationCanceled = `
 [reset][red]The remote operation was successfully cancelled.[reset]
@@ -570,8 +664,6 @@ var schemaDescriptions = map[string]string{
 	"organization": "The name of the organization containing the targeted workspace(s).",
 	"token": "The token used to authenticate with the remote backend. If credentials for the\n" +
 		"host are configured in the CLI Config File, then those will be used instead.",
-	"workspaces": "Workspaces contains arguments used to filter down to a set of workspaces\n" +
-		"to work on.",
 	"name": "A workspace name used to map the default workspace to a named remote workspace.\n" +
 		"When configured only the default workspace can be used. This option conflicts\n" +
 		"with \"prefix\"",

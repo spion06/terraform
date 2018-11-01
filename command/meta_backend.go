@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/hashicorp/errwrap"
@@ -700,11 +701,65 @@ func (m *Meta) backend_C_r_s(c *configs.Backend, cHash int, sMgr *state.LocalSta
 		return nil, diags
 	}
 
+	// Its possible that the currently selected workspace is not migrated,
+	// so we call selectWorkspace to ensure a valid workspace is selected.
+	if err := m.selectWorkspace(b); err != nil {
+		diags = diags.Append(err)
+		return nil, diags
+	}
+
 	m.Ui.Output(m.Colorize().Color(fmt.Sprintf(
 		"[reset][green]\n"+strings.TrimSpace(successBackendSet), s.Backend.Type)))
 
 	// Return the backend
 	return b, diags
+}
+
+// selectWorkspace gets a list of migrated workspaces and then checks
+// if the currently selected workspace is valid. If not, it will ask
+// the user to select a workspace from the list.
+func (m *Meta) selectWorkspace(b backend.Backend) error {
+	workspaces, err := b.Workspaces()
+	if err != nil {
+		return fmt.Errorf("Failed to get migrated workspaces: %s", err)
+	}
+	if len(workspaces) == 0 {
+		return fmt.Errorf(errBackendNoMigratedWorkspaces)
+	}
+
+	// Get the currently selected workspace.
+	workspace := m.Workspace()
+
+	// Check if any of the migrated workspaces match the selected workspace
+	// and create a numbered list with migrated workspaces.
+	var list strings.Builder
+	for i, w := range workspaces {
+		if w == workspace {
+			return nil
+		}
+		fmt.Fprintf(&list, "%d. %s\n", i+1, w)
+	}
+
+	// If the selected workspace is not migrated, ask the user to select
+	// a workspace from the list of migrated workspaces.
+	v, err := m.UIInput().Input(&terraform.InputOpts{
+		Id: "select-workspace",
+		Query: fmt.Sprintf(
+			"[reset][bold][yellow]The currently selected workspace (%s) is not migrated.[reset]",
+			workspace),
+		Description: fmt.Sprintf(
+			strings.TrimSpace(inputBackendSelectWorkspace), list.String()),
+	})
+	if err != nil {
+		return fmt.Errorf("Error asking to select workspace: %s", err)
+	}
+
+	idx, err := strconv.Atoi(v)
+	if err != nil || (idx < 1 || idx > len(workspaces)) {
+		return fmt.Errorf("Error selecting workspace: input not a valid number")
+	}
+
+	return m.SetWorkspace(workspaces[idx-1])
 }
 
 // Changing a previously saved backend.

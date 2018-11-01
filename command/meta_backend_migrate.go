@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/hashicorp/terraform/backend"
@@ -171,56 +170,7 @@ func (m *Meta) backendMigrateState_S_S(opts *backendMigrateOpts) error {
 		}
 	}
 
-	// Its possible that the currently selected workspace is not migrated,
-	// so we call selectWorkspace to ensure a valid workspace is selected.
-	return m.selectWorkspace(opts.Two)
-}
-
-// selectWorkspace gets a list of migrated workspaces and then checks
-// if the currently selected workspace is valid. If not, it will ask
-// the user to select a workspace from the list.
-func (m *Meta) selectWorkspace(b backend.Backend) error {
-	workspaces, err := b.Workspaces()
-	if err != nil {
-		return fmt.Errorf("Failed to get migrated workspaces: %s", err)
-	}
-	if len(workspaces) == 0 {
-		return fmt.Errorf(errBackendNoMigratedWorkspaces)
-	}
-
-	// Get the currently selected workspace.
-	workspace := m.Workspace()
-
-	// Check if any of the migrated workspaces match the selected workspace
-	// and create a numbered list with migrated workspaces.
-	var list strings.Builder
-	for i, w := range workspaces {
-		if w == workspace {
-			return nil
-		}
-		fmt.Fprintf(&list, "%d. %s\n", i+1, w)
-	}
-
-	// If the selected workspace is not migrated, ask the user to select
-	// a workspace from the list of migrated workspaces.
-	v, err := m.UIInput().Input(&terraform.InputOpts{
-		Id: "select-workspace",
-		Query: fmt.Sprintf(
-			"[reset][bold][yellow]The currently selected workspace (%s) is not migrated.[reset]",
-			workspace),
-		Description: fmt.Sprintf(
-			strings.TrimSpace(inputBackendSelectWorkspace), list.String()),
-	})
-	if err != nil {
-		return fmt.Errorf("Error asking to select workspace: %s", err)
-	}
-
-	idx, err := strconv.Atoi(v)
-	if err != nil || (idx < 1 || idx > len(workspaces)) {
-		return fmt.Errorf("Error selecting workspace: input not a valid number")
-	}
-
-	return m.SetWorkspace(workspaces[idx-1])
+	return nil
 }
 
 // Multi-state to single state.

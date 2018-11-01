@@ -43,13 +43,13 @@ func TestBackendConfig(t *testing.T, b Backend, c hcl.Body) Backend {
 	diags = diags.Append(valDiags.InConfigBody(c))
 
 	if len(diags) != 0 {
-		t.Fatal(diags)
+		t.Fatal(diags.ErrWithWarnings())
 	}
 
 	confDiags := b.Configure(obj)
 	if len(confDiags) != 0 {
 		confDiags = confDiags.InConfigBody(c)
-		t.Fatal(confDiags)
+		t.Fatal(confDiags.ErrWithWarnings())
 	}
 
 	return b
@@ -123,8 +123,8 @@ func TestBackendStates(t *testing.T, b Backend) {
 	{
 		// We'll use two distinct states here and verify that changing one
 		// does not also change the other.
-		barState := states.NewState()
 		fooState := states.NewState()
+		barState := states.NewState()
 
 		// write a known state to foo
 		if err := foo.WriteState(fooState); err != nil {
@@ -183,7 +183,7 @@ func TestBackendStates(t *testing.T, b Backend) {
 			t.Fatal("after writing a resource to bar and re-reading foo, foo now has resources too")
 		}
 
-		// fetch the bar  again from the backend
+		// fetch the bar again from the backend
 		bar, err = b.StateMgr("bar")
 		if err != nil {
 			t.Fatal("error re-fetching state:", err)
